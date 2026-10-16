@@ -5,3 +5,5 @@ python-dotenv
 pypdf
 reportlab
 pymupdf
+pytesseract
+Pillow
