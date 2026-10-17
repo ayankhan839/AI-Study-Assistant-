@@ -139,6 +139,38 @@ st.markdown(
         color: #fda4af !important;
     }
 
+    /* FIX: keep typed text readable in Streamlit's light chat input */
+    [data-testid="stChatInput"] textarea,
+    [data-testid="stChatInput"] textarea:focus,
+    [data-testid="stTextInput"] input,
+    [data-testid="stTextArea"] textarea {
+        color: #111827 !important;
+        -webkit-text-fill-color: #111827 !important;
+        caret-color: #111827 !important;
+        background-color: #f8fafc !important;
+        opacity: 1 !important;
+    }
+
+    [data-testid="stChatInput"] textarea::placeholder,
+    [data-testid="stTextInput"] input::placeholder,
+    [data-testid="stTextArea"] textarea::placeholder {
+        color: #64748b !important;
+        -webkit-text-fill-color: #64748b !important;
+        opacity: 1 !important;
+    }
+
+    /* Streamlit chat input wrapper and send button stay visible */
+    [data-testid="stChatInput"] {
+        background-color: #f8fafc !important;
+        border: 1px solid #cbd5e1 !important;
+        border-radius: 10px !important;
+    }
+
+    [data-testid="stChatInput"] button {
+        color: #ffffff !important;
+        background-color: #ef4444 !important;
+    }
+
     div[data-baseweb="select"] * {
         color: #0f172a;
     }
@@ -152,34 +184,60 @@ st.markdown(
 # 3. GEMINI CLIENT
 # =========================================================
 
-api_key = os.getenv("GEMINI_API_KEY", "").strip()
+# Streamlit Cloud uses st.secrets; local development can use a .env file.
+try:
+    api_key = str(st.secrets["GEMINI_API_KEY"]).strip()
+except (KeyError, FileNotFoundError):
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
 
 if not api_key:
-    st.error("GEMINI_API_KEY is missing from your .env file.")
+    st.error(
+        "Gemini API key is not configured. Add GEMINI_API_KEY in "
+        "Streamlit Cloud → App settings → Secrets, or add it to your local .env file."
+    )
     st.stop()
 
 client = genai.Client(api_key=api_key)
 
 
 def ask_ai(prompt, max_output_tokens=1800):
-    """Generate a concise answer using Gemini."""
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config={
-            "max_output_tokens": max_output_tokens,
-            "temperature": 0.3,
-        },
-    )
-
-    answer = response.text
-
-    if not answer:
-        raise ValueError(
-            "The model returned an empty answer. Try again."
+    """Generate an answer using Gemini and show useful errors when it fails."""
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config={
+                "max_output_tokens": max_output_tokens,
+                "temperature": 0.3,
+            },
         )
 
-    return answer.strip()
+        answer = response.text
+        if not answer or not answer.strip():
+            raise RuntimeError(
+                "Gemini returned an empty answer. Please try again."
+            )
+        return answer.strip()
+
+    except Exception as error:
+        message = str(error).lower()
+        if "503" in message or "unavailable" in message or "overloaded" in message:
+            friendly = (
+                "Gemini is temporarily busy. Please wait a little and try again. "
+                "Your uploaded material may still be available."
+            )
+        elif "429" in message or "resource_exhausted" in message or "quota" in message:
+            friendly = (
+                "The AI service has reached a rate or usage limit. Please wait "
+                "for the limit to reset, then try again."
+            )
+        elif "401" in message or "403" in message or "api key" in message:
+            friendly = (
+                "Gemini rejected the request. Check the API key and API access settings."
+            )
+        else:
+            friendly = "The AI request failed. Please try again. Details: " + str(error)[:250]
+        raise RuntimeError(friendly) from error
 
 
 def save_result(title, text):
@@ -473,6 +531,12 @@ for key, value in defaults.items():
 # 6. HEADER AND SIDEBAR
 # =========================================================
 
+st.markdown(
+    "<div style=\"text-align:center; padding:8px 0 2px; color:#94a3b8; "
+    "font-size:0.95rem;\">Created by <strong style=\"color:#e2e8f0;\">"
+    "Ayankhan Pathan</strong></div>",
+    unsafe_allow_html=True,
+)
 st.title("📚 AI Study Assistant")
 st.markdown("### Learn smarter. Revise faster. Understand better.")
 st.caption("An AI-powered learning companion for students")
@@ -1048,4 +1112,9 @@ st.divider()
 st.caption(
     "AI Study Assistant | Check important answers against textbooks "
     "and trusted sources."
+)
+st.markdown(
+    "<div style=\"text-align:center; padding:10px 0 4px; color:#94a3b8; "
+    "font-size:0.9rem;\">Created by <strong style=\"color:#e2e8f0;\">Ayankhan Pathan</strong></div>",
+    unsafe_allow_html=True,
 )
