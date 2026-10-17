@@ -18,10 +18,12 @@ from reportlab.platypus import (
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from pypdf import PdfReader
 import pymupdf
 import pytesseract
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance, UnidentifiedImageError
+from docx import Document
 
 _TESSERACT_EXE = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
 if os.path.exists(_TESSERACT_EXE):
@@ -51,6 +53,8 @@ MAX_AI_TEXT = 12000
 MAX_UPLOAD_TEXT = 1000000
 OCR_LANGUAGES = "eng+guj+hin"
 OCR_RENDER_SCALE = 3.0
+MAX_HANDWRITING_AI_PAGES = 8  # Limit Gemini vision usage per upload.
+MAX_HANDWRITING_AI_IMAGE_PAGES = 4  # Limit vision use for multi-image uploads.
 
 
 # =========================================================
@@ -240,6 +244,25 @@ def ask_ai(prompt, max_output_tokens=1800):
         else:
             friendly = "The AI request failed. Please try again. Details: " + str(error)[:250]
         raise RuntimeError(friendly) from error
+
+
+def read_handwriting_with_ai(image_bytes):
+    """Best-effort handwriting OCR for one rendered page; caller handles failures."""
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            (
+                "Read the text visible in this document image as accurately as possible. "
+                "It may be handwritten or printed and may use English, Gujarati, or Hindi. "
+                "Preserve the original language and wording. Do not translate, summarize, "
+                "guess unreadable words, or add explanations. Mark genuinely unreadable "
+                "words as [unreadable]. Return only the transcribed text."
+            ),
+        ],
+        config={"max_output_tokens": 1800, "temperature": 0.0},
+    )
+    return (response.text or "").strip()
 
 
 def save_result(title, text):
@@ -577,19 +600,28 @@ with st.sidebar:
 
 
 # =========================================================
-# 7. UPLOAD PDF OR TXT
+# 7. UPLOAD STUDY MATERIAL: PDF, TEXT, IMAGES, AND WORD DOCX
 # =========================================================
 
 with st.expander("📎 Upload study material (optional)"):
 
     uploaded = st.file_uploader(
-        "Choose a PDF or TXT file (up to 500 MB)",
-        type=["pdf", "txt"],
+        "Choose PDF, image, Word (.docx), or TXT file (up to 500 MB)",
+        type=["pdf", "txt", "docx", "jpg", "jpeg", "jfif", "png", "webp", "bmp", "gif", "tif", "tiff"],
         help=(
-            "Supports selectable-text PDFs and scanned/image-based PDFs. "
-            "OCR is attempted in English, Gujarati, and Hindi when needed."
+            "PDF: selectable text and scanned pages. Images: JPG/JPEG/JFIF, PNG, WEBP, BMP, GIF, TIFF; uploaded photos always try AI handwriting recognition. "
+            "Word: DOCX. Local Tesseract OCR supports English, Gujarati, and Hindi. "
+            "Photo handwriting recognition uses Gemini tokens; scanned PDF fallback is optional. "
+            "Legacy .doc files are not supported; save them as .docx first."
         ),
         key="study_file_upload",
+    )
+
+    handwriting_ai_enabled = st.checkbox(
+        "Try AI handwriting recognition on difficult scanned pages (uses Gemini tokens; up to 8 pages per PDF)",
+        value=False,
+        key="handwriting_ai_enabled",
+        help="Enable this for handwritten notes. It only runs when local OCR appears weak; failures do not stop the PDF import.",
     )
 
     if uploaded is not None:
@@ -614,6 +646,8 @@ with st.expander("📎 Upload study material (optional)"):
                         pdf_for_ocr = None
                         ocr_pages = []
                         failed_ocr_pages = []
+                        handwriting_ai_pages = []
+                        vision_pages_used = 0
                         available_languages = set()
 
                         # Extract selectable text first; render only pages that appear
@@ -685,6 +719,44 @@ with st.expander("📎 Upload study material (optional)"):
                                         lang=ocr_language,
                                         config="--psm 3",
                                     ).strip()
+
+                                    # Estimate local OCR confidence without requiring another package.
+                                    try:
+                                        confidence_values = [
+                                            float(value) for value in pytesseract.image_to_data(
+                                                image, lang=ocr_language, config="--psm 3",
+                                                output_type=pytesseract.Output.DICT
+                                            )["conf"]
+                                            if str(value).strip() not in ("", "-1") and float(value) >= 0
+                                        ]
+                                        mean_confidence = (
+                                            sum(confidence_values) / len(confidence_values)
+                                            if confidence_values else 0.0
+                                        )
+                                    except Exception:
+                                        mean_confidence = 0.0
+
+                                    # Optional, capped vision fallback for handwriting or very poor OCR.
+                                    # Any AI error is non-fatal: the app keeps the local OCR result.
+                                    weak_ocr = len(ocr_text) < 100 or mean_confidence < 40
+                                    if (
+                                        handwriting_ai_enabled
+                                        and weak_ocr
+                                        and vision_pages_used < MAX_HANDWRITING_AI_PAGES
+                                    ):
+                                        try:
+                                            vision_pages_used += 1
+                                            ai_text = read_handwriting_with_ai(pix.tobytes("png"))
+                                            if ai_text and len(ai_text) > len(ocr_text):
+                                                ocr_text = ai_text
+                                                handwriting_ai_pages.append(page_index + 1)
+                                        except Exception as vision_error:
+                                            st.info(
+                                                f"AI handwriting recognition skipped page {page_index + 1}; "
+                                                "local OCR will be used if available. "
+                                                f"Reason: {str(vision_error)[:140]}"
+                                            )
+
                                     # Keep OCR only when it gives more useful text than
                                     # embedded extraction, avoiding unnecessary replacement.
                                     if len(ocr_text) > len(page_text):
@@ -723,11 +795,104 @@ with st.expander("📎 Upload study material (optional)"):
                             )
                         elif pdf_for_ocr is not None and not material:
                             st.info("No selectable text was found. OCR may not have been able to read this PDF.")
+                        if handwriting_ai_pages:
+                            st.success(
+                                "AI handwriting recognition was used on page(s): "
+                                + ", ".join(map(str, handwriting_ai_pages[:30]))
+                                + ("…" if len(handwriting_ai_pages) > 30 else "")
+                                + ". Please review the extracted text for handwriting errors."
+                            )
+                        if handwriting_ai_enabled and vision_pages_used >= MAX_HANDWRITING_AI_PAGES:
+                            st.caption(
+                                f"AI handwriting fallback is capped at {MAX_HANDWRITING_AI_PAGES} pages per PDF to control token usage."
+                            )
                         if failed_ocr_pages:
                             st.warning(
                                 f"OCR failed on {len(failed_ocr_pages)} page(s). "
                                 "Other pages may still have been extracted successfully."
                             )
+                elif uploaded.name.lower().endswith((".jpg", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff")):
+                    image_bytes = uploaded.getvalue()
+                    try:
+                        image = Image.open(BytesIO(image_bytes))
+                        image = ImageOps.exif_transpose(image).convert("RGB")
+                        image = ImageOps.autocontrast(image.convert("L"))
+                        image = ImageEnhance.Contrast(image).enhance(1.25)
+                    except (UnidentifiedImageError, OSError, ValueError) as image_error:
+                        raise RuntimeError(
+                            "This image could not be opened. Please upload a valid JPG/JPEG, PNG, WEBP, BMP, GIF, or TIFF image."
+                        ) from image_error
+
+                    try:
+                        available_languages = set(pytesseract.get_languages(config=""))
+                    except Exception:
+                        available_languages = set()
+                    selected_languages = [lang for lang in ["eng", "guj", "hin"] if lang in available_languages]
+                    ocr_language = "+".join(selected_languages) or "eng"
+                    if not selected_languages:
+                        st.warning("Tesseract language data was not detected. Image OCR may fail on this deployment.")
+                    try:
+                        local_text = pytesseract.image_to_string(image, lang=ocr_language, config="--psm 3").strip()
+                        try:
+                            confs = [float(v) for v in pytesseract.image_to_data(
+                                image, lang=ocr_language, config="--psm 3", output_type=pytesseract.Output.DICT
+                            )["conf"] if str(v).strip() not in ("", "-1") and float(v) >= 0]
+                            confidence = sum(confs) / len(confs) if confs else 0.0
+                        except Exception:
+                            confidence = 0.0
+                    except Exception as ocr_error:
+                        local_text, confidence = "", 0.0
+                        st.warning(f"Local image OCR failed: {str(ocr_error)[:180]}")
+
+                    material = local_text
+                    # For an uploaded photo, always try Gemini vision once. Handwriting
+                    # may produce plenty of characters but still be incorrectly read by
+                    # Tesseract, so character count/confidence alone is not a safe gate.
+                    # Normalize every supported image format to PNG before sending it.
+                    try:
+                        normalized_image = ImageOps.exif_transpose(
+                            Image.open(BytesIO(image_bytes))
+                        ).convert("RGB")
+                        png_buffer = BytesIO()
+                        normalized_image.save(png_buffer, format="PNG", optimize=True)
+                        ai_text = read_handwriting_with_ai(png_buffer.getvalue())
+                        if ai_text:
+                            material = ai_text
+                            st.success(
+                                "AI handwriting/image recognition finished. Please review the transcription for mistakes."
+                            )
+                        elif material:
+                            st.warning("AI returned no transcription; using local OCR text instead.")
+                        else:
+                            st.warning("No text was recognized. Try a clearer, well-lit photo with the page fully visible.")
+                    except Exception as vision_error:
+                        if material:
+                            st.warning(
+                                "AI handwriting recognition was unavailable; using local OCR text instead. "
+                                + str(vision_error)[:160]
+                            )
+                        else:
+                            st.error(
+                                "Could not recognize text from this image. Check your Gemini API key/model or try a clearer image. "
+                                + str(vision_error)[:160]
+                            )
+                    if material:
+                        st.success("Image text extraction is ready for Study Chat, Notes, Summary, and Quiz.")
+
+                elif uploaded.name.lower().endswith(".docx"):
+                    try:
+                        document = Document(BytesIO(uploaded.getvalue()))
+                        doc_parts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+                        # Include table contents because many study notes and worksheets use tables.
+                        for table in document.tables:
+                            for row in table.rows:
+                                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                                if row_text:
+                                    doc_parts.append(row_text)
+                        material = "\n".join(doc_parts).strip()[:MAX_UPLOAD_TEXT]
+                    except Exception as doc_error:
+                        raise RuntimeError("Could not read this Word document. Please upload a valid .docx file.") from doc_error
+
                 else:
                     material = uploaded.getvalue().decode(
                         "utf-8-sig", errors="replace"
