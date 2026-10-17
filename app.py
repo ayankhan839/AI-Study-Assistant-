@@ -21,7 +21,7 @@ from google import genai
 from pypdf import PdfReader
 import pymupdf
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance
 
 _TESSERACT_EXE = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
 if os.path.exists(_TESSERACT_EXE):
@@ -49,6 +49,8 @@ MODEL_NAME = os.getenv(
 # Limit the text sent to the AI to reduce token usage.
 MAX_AI_TEXT = 12000
 MAX_UPLOAD_TEXT = 1000000
+OCR_LANGUAGES = "eng+guj+hin"
+OCR_RENDER_SCALE = 3.0
 
 
 # =========================================================
@@ -583,7 +585,10 @@ with st.expander("📎 Upload study material (optional)"):
     uploaded = st.file_uploader(
         "Choose a PDF or TXT file (up to 500 MB)",
         type=["pdf", "txt"],
-        help="Text-based PDFs work best. Scanned PDFs may need OCR.",
+        help=(
+            "Supports selectable-text PDFs and scanned/image-based PDFs. "
+            "OCR is attempted in English, Gujarati, and Hindi when needed."
+        ),
         key="study_file_upload",
     )
 
@@ -607,42 +612,90 @@ with st.expander("📎 Upload study material (optional)"):
                         parts = []
                         char_count = 0
                         pdf_for_ocr = None
-                        ocr_used = False
+                        ocr_pages = []
+                        failed_ocr_pages = []
+                        available_languages = set()
 
-                        # Extract embedded text first. If a page has no meaningful
-                        # text, render that page and use Tesseract OCR.
+                        # Extract selectable text first; render only pages that appear
+                        # scanned or contain too little embedded text for their images.
                         try:
                             pdf_for_ocr = pymupdf.open(stream=pdf_bytes, filetype="pdf")
                         except Exception as render_error:
-                            st.warning(f"Could not prepare PDF pages for OCR: {render_error}")
+                            st.warning(
+                                "The PDF text may still be readable, but scanned-page OCR "
+                                f"could not be prepared: {render_error}"
+                            )
+
+                        if pdf_for_ocr is not None:
+                            try:
+                                available_languages = set(pytesseract.get_languages(config=""))
+                            except Exception:
+                                available_languages = set()
+
+                        wanted_languages = ["eng", "guj", "hin"]
+                        selected_languages = [
+                            language for language in wanted_languages
+                            if language in available_languages
+                        ]
+                        ocr_language = "+".join(selected_languages) or "eng"
+                        if pdf_for_ocr is not None and not selected_languages:
+                            st.warning(
+                                "Tesseract language data was not detected. OCR may fail; "
+                                "check that packages.txt installs English, Gujarati, and Hindi data."
+                            )
+                        elif pdf_for_ocr is not None and len(selected_languages) < len(wanted_languages):
+                            missing = [lang for lang in wanted_languages if lang not in selected_languages]
+                            st.warning(
+                                "Some OCR language data is unavailable (" + ", ".join(missing) +
+                                "). The installed languages will be used for this upload."
+                            )
 
                         total_pages = len(reader.pages)
-                        progress = st.progress(0, text="Reading PDF text…")
+                        progress = st.progress(0, text="Extracting PDF text…")
                         for page_index, page in enumerate(reader.pages):
                             if char_count >= MAX_UPLOAD_TEXT:
                                 break
 
                             page_text = (page.extract_text() or "").strip()
+                            should_try_ocr = len(page_text) < 40
 
-                            # OCR pages that have no/little extracted text, including
-                            # scanned PDFs that contain only page images.
-                            if len(page_text) < 40 and pdf_for_ocr is not None:
+                            # A page may have a scanned/image-based main body plus a
+                            # small selectable header/footer. OCR it when the text is
+                            # sparse and the page contains embedded images.
+                            if pdf_for_ocr is not None and not should_try_ocr and len(page_text) < 250:
                                 try:
-                                    pix = pdf_for_ocr[page_index].get_pixmap(
-                                        matrix=pymupdf.Matrix(2, 2),
+                                    image_count = len(pdf_for_ocr[page_index].get_images(full=True))
+                                    should_try_ocr = image_count > 0
+                                except Exception:
+                                    pass
+
+                            if should_try_ocr and pdf_for_ocr is not None:
+                                try:
+                                    page_obj = pdf_for_ocr[page_index]
+                                    pix = page_obj.get_pixmap(
+                                        matrix=pymupdf.Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE),
                                         alpha=False,
+                                        colorspace=pymupdf.csGRAY,
                                     )
-                                    image = Image.open(BytesIO(pix.tobytes("png")))
+                                    image = Image.open(BytesIO(pix.tobytes("png"))).convert("L")
+                                    image = ImageOps.autocontrast(image)
+                                    image = ImageEnhance.Contrast(image).enhance(1.25)
                                     ocr_text = pytesseract.image_to_string(
-                                        image, lang="eng"
+                                        image,
+                                        lang=ocr_language,
+                                        config="--psm 3",
                                     ).strip()
+                                    # Keep OCR only when it gives more useful text than
+                                    # embedded extraction, avoiding unnecessary replacement.
                                     if len(ocr_text) > len(page_text):
                                         page_text = ocr_text
-                                        ocr_used = True
+                                        ocr_pages.append(page_index + 1)
                                 except Exception as ocr_error:
+                                    failed_ocr_pages.append(page_index + 1)
                                     st.warning(
-                                        f"OCR could not read page {page_index + 1}: "
-                                        f"{ocr_error}"
+                                        f"OCR could not read page {page_index + 1}. "
+                                        "Try a clearer scan or check the OCR language packages. "
+                                        f"Details: {str(ocr_error)[:180]}"
                                     )
 
                             remaining = MAX_UPLOAD_TEXT - char_count
@@ -653,16 +706,28 @@ with st.expander("📎 Upload study material (optional)"):
 
                             progress.progress(
                                 min((page_index + 1) / max(total_pages, 1), 1.0),
-                                text=f"Reading page {page_index + 1} of {total_pages}…",
+                                text=f"Processing page {page_index + 1} of {total_pages}…",
                             )
 
                         progress.empty()
                         if pdf_for_ocr is not None:
                             pdf_for_ocr.close()
 
-                        material = "\\n\\n".join(parts).strip()
-                        if ocr_used and material:
-                            st.info("OCR was used to read scanned or image-based PDF pages.")
+                        material = "\n\n".join(parts).strip()
+                        if ocr_pages and material:
+                            st.success(
+                                "OCR successfully improved text extraction on "
+                                f"{len(ocr_pages)} page(s): " +
+                                ", ".join(map(str, ocr_pages[:30])) +
+                                ("…" if len(ocr_pages) > 30 else "")
+                            )
+                        elif pdf_for_ocr is not None and not material:
+                            st.info("No selectable text was found. OCR may not have been able to read this PDF.")
+                        if failed_ocr_pages:
+                            st.warning(
+                                f"OCR failed on {len(failed_ocr_pages)} page(s). "
+                                "Other pages may still have been extracted successfully."
+                            )
                 else:
                     material = uploaded.getvalue().decode(
                         "utf-8-sig", errors="replace"
