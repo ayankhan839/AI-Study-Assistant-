@@ -6,3 +6,4 @@ reportlab
 pymupdf
 pytesseract
 Pillow
+python-docx
