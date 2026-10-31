@@ -7,3 +7,6 @@ pymupdf
 pytesseract
 Pillow
 python-docx
+fastapi
+uvicorn[standard]
+python-multipart
