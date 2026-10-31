@@ -24,7 +24,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, KeepTogether
 
 ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / ".env")
+load_dotenv(ROOT.parent / ".env")
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 MAX_UPLOAD_TEXT = 1000000
 MAX_AI_TEXT = 12000
@@ -68,6 +68,29 @@ def limited_material(text, limit=MAX_AI_TEXT):
     text = (text or "").strip()
     return text[:limit] + ("\n[Material shortened to save tokens.]" if len(text) > limit else "")
 
+
+def extract_with_gemini_vision(data, mime_type, page_number=None):
+    """Transcribe printed or handwritten study material using Gemini vision."""
+    if client is None:
+        return ""
+    location = f" on PDF page {page_number}" if page_number else ""
+    prompt = f"""Transcribe all readable content in this study image{location}.
+It may contain printed text, handwriting, equations, tables, labels, or mixed content.
+Preserve the original language, wording, headings, bullets, numbering, and equations.
+Do not summarize, translate, correct, or invent missing words.
+For unreadable words, write [unclear]. Keep table rows understandable.
+Return only the transcription."""
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[prompt, types.Part.from_bytes(data=data, mime_type=mime_type)],
+            config={"max_output_tokens": 2500, "temperature": 0.1},
+        )
+        return (response.text or "").strip()
+    except Exception:
+        return ""
+
+
 def extract_docx(data):
     doc = Document(BytesIO(data))
     parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
@@ -106,6 +129,12 @@ def extract_pdf(data):
                 ocr = pytesseract.image_to_string(image, lang=language, config="--psm 3").strip()
                 if len(ocr) > len(text):
                     text = ocr
+                # Vision OCR helps with handwriting and mixed printed/scanned pages.
+                if len(text) < 120:
+                    vision = extract_with_gemini_vision(pix.tobytes("png"), "image/png", i + 1)
+                    if len(vision) > len(text):
+                        text = vision
+                if text:
                     ocr_pages.append(i + 1)
             except Exception:
                 failed.append(i + 1)
@@ -126,7 +155,12 @@ def extract_image(data):
         langs = set()
     selected = [x for x in ["eng", "guj", "hin"] if x in langs]
     local = pytesseract.image_to_string(gray, lang="+".join(selected) or "eng", config="--psm 3").strip()
-    return {"text": local[:MAX_UPLOAD_TEXT], "ocr_languages": selected}
+    image_format = Image.open(BytesIO(data)).format or "JPEG"
+    mime_type = Image.MIME.get(image_format, "image/jpeg")
+    vision = extract_with_gemini_vision(data, mime_type)
+    text = vision if len(vision) > len(local) else local
+    engine = "Gemini Vision" if vision and text == vision else "Tesseract"
+    return {"text": text[:MAX_UPLOAD_TEXT], "ocr_languages": selected, "ocr_engine": engine}
 
 @app.get("/api/health")
 def health():
