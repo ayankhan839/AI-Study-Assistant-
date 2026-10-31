@@ -245,19 +245,42 @@ def quiz(req: StudyRequest):
     if not req.topic.strip() and not req.material.strip():
         raise HTTPException(status_code=400, detail="Enter a topic or upload study material.")
     topic = req.topic.strip() or "the uploaded study material"
-    prompt = f"""Create {req.count} MCQs for: "{topic}".
-Stay on the requested subject. If material is uploaded, use ONLY relevant material as primary source.
-Difficulty: {req.level}. Exactly {req.count} questions, four options A-D, one correct answer,
-answer field only A/B/C/D, one-sentence explanation, no duplicates.
-Return ONLY valid JSON:
-{{"questions":[{{"question":"Question","options":[{{"label":"A) option","value":"A"}},{{"label":"B) option","value":"B"}},{{"label":"C) option","value":"C"}},{{"label":"D) option","value":"D"}}],"answer":"B","explanation":"Reason"}}]}}
-Study material:
-{limited_material(req.material, 24000) or 'No uploaded material.'}"""
+    source = limited_material(req.material, 24000) or "No uploaded material."
+    questions = []
+    seen = set()
+    batch_size = 8
     try:
-        questions = parse_quiz(ask_ai(prompt, 7000 if req.count <= 32 else 8000))
+        # Generate small batches so the model does not truncate a 30–35 question response.
+        for start in range(0, req.count, batch_size):
+            target = min(batch_size, req.count - start)
+            attempts = 0
+            while sum(1 for q in questions if q.get("_batch") == start) < target and attempts < 3:
+                attempts += 1
+                existing = [q["question"] for q in questions]
+                remaining = target - sum(1 for q in questions if q.get("_batch") == start)
+                prompt = f"""Create exactly {remaining} NEW multiple-choice questions about "{topic}".
+Difficulty: {req.level}. Stay on the requested subject. Use the uploaded material as the primary source; do not invent source-specific facts.
+Do not repeat or paraphrase these existing questions: {json.dumps(existing[-req.count:], ensure_ascii=False)}
+Each question must have four options labelled A, B, C, D; answer must be exactly one letter A/B/C/D; include a concise explanation.
+Return ONLY valid JSON in this format:
+{{"questions":[{{"question":"Question text","options":[{{"label":"A) option","value":"A"}},{{"label":"B) option","value":"B"}},{{"label":"C) option","value":"C"}},{{"label":"D) option","value":"D"}}],"answer":"B","explanation":"Reason"}}]}}
+Uploaded study material:
+{source}"""
+                batch = parse_quiz(ask_ai(prompt, 3000))
+                for item in batch:
+                    key = re.sub(r"\\W+", " ", item["question"].lower()).strip()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    item["_batch"] = start
+                    questions.append(item)
+        if len(questions) < req.count:
+            raise ValueError(f"Gemini returned {len(questions)} of {req.count} requested questions. Please try again.")
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {"topic": topic, "questions": questions, "requested_count": req.count, "returned_count": len(questions)}
+    for item in questions:
+        item.pop("_batch", None)
+    return {"topic": topic, "questions": questions[:req.count], "requested_count": req.count, "returned_count": min(len(questions), req.count)}
 
 @app.post("/api/quiz/pdf")
 def quiz_pdf(payload: dict):
