@@ -268,7 +268,7 @@ Uploaded study material:
 {source}"""
                 batch = parse_quiz(ask_ai(prompt, 3000))
                 for item in batch:
-                    key = re.sub(r"\\W+", " ", item["question"].lower()).strip()
+                    key = re.sub(r"\W+", " ", item["question"].lower()).strip()
                     if key in seen:
                         continue
                     seen.add(key)
