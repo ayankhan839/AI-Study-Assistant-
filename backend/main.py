@@ -129,11 +129,10 @@ def extract_pdf(data):
                 ocr = pytesseract.image_to_string(image, lang=language, config="--psm 3").strip()
                 if len(ocr) > len(text):
                     text = ocr
-                # Vision OCR helps with handwriting and mixed printed/scanned pages.
-                if len(text) < 120:
-                    vision = extract_with_gemini_vision(pix.tobytes("png"), "image/png", i + 1)
-                    if len(vision) > len(text):
-                        text = vision
+                # Always compare vision transcription with local OCR on scanned pages.
+                vision = extract_with_gemini_vision(pix.tobytes("png"), "image/png", i + 1)
+                if len(vision) > len(text):
+                    text = vision
                 if text:
                     ocr_pages.append(i + 1)
             except Exception:
